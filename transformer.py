@@ -16,6 +16,37 @@ class Config:
     sliding_window: int = 128
 
 
+def build_rope_cache(max_seq_len, head_dim, base=10000, device="cuda"):
+    inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim))
+    m = torch.arange(max_seq_len, device=device).float()
+
+    freqs = torch.einsum("i,j->ij", m, inv_freq)
+    
+    cos = freqs.cos()[None, None, :, :]
+    sin = freqs.sin()[None, None, :, :]
+
+    return cos, sin
+
+
+def apply_rope(x, cos, sin, seq_start=0):
+    bsz, n_heads, seq_len, head_dim = x.shape
+    cos = cos[:, :, seq_start:seq_start + seq_len, :]
+    sin = sin[:, :, seq_start:seq_start + seq_len, :]
+
+    x_even = x[..., 0::2]
+    x_odd = x[..., 1::2]
+
+    x_rot_even = x_even * cos - x_odd * sin
+    x_rot_odd = x_even * sin + x_odd * cos
+
+    x_rot = torch.empty_like(x)
+    print(x_rot.shape, seq_start, seq_len)
+    x_rot[..., 0::2] = x_rot_even
+    x_rot[..., 1::2] = x_rot_odd
+
+    return x_rot
+
+
 class RMSNorm(nn.Module):
     def __init__(self, d_model, eps=1e-8):
         super().__init__()
@@ -51,13 +82,14 @@ def build_mask(seq_len, total_len, past_len=0, sliding_window=0, device="cuda"):
 
 
 class Attention(nn.Module):
-    def __init__(self, dmodel, n_heads, n_kv_heads):
+    def __init__(self, dmodel, n_heads, n_kv_heads, max_seq_len):
         super().__init__()
         self.head_dim = dmodel // n_heads
         self.q_proj = nn.Linear(dmodel, self.head_dim * n_heads, bias=False)
         self.k_proj = nn.Linear(dmodel, self.head_dim * n_kv_heads, bias=False)
         self.v_proj = nn.Linear(dmodel, self.head_dim * n_kv_heads, bias=False)
         self.out_proj = nn.Linear(dmodel, dmodel, bias=False)
+        self.cos, self.sin = build_rope_cache(max_seq_len, self.head_dim)
     
     def forward(self, x, mask, past_kv, use_cache):
         B, L, D = x.shape
@@ -70,12 +102,17 @@ class Attention(nn.Module):
             past_k, past_v = past_kv
             k = torch.cat([past_k, k], dim=2)
             v = torch.cat([past_v, v], dim=2)
+            q_start = past_k.shape[2]
+        else:
+            q_start = 0
 
         if q.shape[1] != k.shape[1]:
             k_repeat = k.repeat_interleave(q.shape[1] // k.shape[1], dim=1)
             v_repeat = v.repeat_interleave(q.shape[1] // v.shape[1], dim=1)
 
         # rope
+        q = apply_rope(q, self.cos, self.sin, seq_start=q_start)
+        k_repeat = apply_rope(k_repeat, self.cos, self.sin)
 
         scores = torch.matmul(q, k_repeat.transpose(-1, -2)) / (self.head_dim ** 0.5)
         scores += mask
@@ -92,10 +129,10 @@ class Attention(nn.Module):
 
 
 class DecoderLayer(nn.Module):
-    def __init__(self, d_model, n_heads, d_ff, n_kv_heads):
+    def __init__(self, d_model, n_heads, d_ff, n_kv_heads, max_seq_len):
         super().__init__()
 
-        self.self_attn = Attention(d_model, n_heads, n_kv_heads)
+        self.self_attn = Attention(d_model, n_heads, n_kv_heads, max_seq_len)
         self.mlp = MLP(d_model, d_ff)
         self.input_norm = RMSNorm(d_model)
         self.post_attn_norm = RMSNorm(d_model)
@@ -120,7 +157,7 @@ class Transformer(nn.Module):
         self.config = config
         self.embedding = nn.Embedding(config.vocab_size, config.d_model)
         self.layers = nn.ModuleList([
-            DecoderLayer(config.d_model, config.n_heads, config.d_ff, config.n_kv_heads)
+            DecoderLayer(config.d_model, config.n_heads, config.d_ff, config.n_kv_heads, config.max_seq_len)
         for _ in range(config.n_layers)])
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
         self.sliding_window = config.sliding_window
@@ -231,5 +268,6 @@ if __name__ == "__main__":
     print(f"Loss: {loss.item()}")
 
     # inference
-    out = model.generate(sample_input, top_p=0.95, max_new_tokens=20, eos_token_id=50256)
+    inference_input = sample_input[:, :1000]
+    out = model.generate(inference_input, top_p=0.95, max_new_tokens=20, eos_token_id=50256)
     print(f"Generated shape (inference): {out.shape}")
